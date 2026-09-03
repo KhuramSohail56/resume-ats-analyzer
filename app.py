@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import time
 from typing import List
 
 import streamlit as st
@@ -9,8 +10,10 @@ from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from docx import Document
 
-MODEL_NAME = "gemini-3.7-flash"
+PRIMARY_MODEL = "gemini-3.8-flash"
+FALLBACK_MODELS = ["gemini-3.7-flash", "gemini-3.6-flash"]
 MAX_RESUME_CHARS = 50000
+MAX_RETRIES_PER_MODEL = 3
 
 
 class Improvement(BaseModel):
@@ -94,25 +97,55 @@ RESUME:
 {resume_text}
 """
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config={
-            "temperature": 0.2,
-            "response_mime_type": "application/json",
-            "response_schema": ATSResult.model_json_schema(),
-        },
+    # 503 means the Gemini service is temporarily overloaded.
+    # Retry with exponential backoff, then try Flash fallback models.
+    models_to_try = [PRIMARY_MODEL] + FALLBACK_MODELS
+    last_error = None
+
+    for model_name in models_to_try:
+        for attempt in range(MAX_RETRIES_PER_MODEL):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config={
+                        "response_mime_type": "application/json",
+                        "response_schema": ATSResult.model_json_schema(),
+                    },
+                )
+
+                if not response.text:
+                    raise RuntimeError("Gemini returned an empty response.")
+
+                try:
+                    return ATSResult.model_validate_json(response.text)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Could not parse Gemini's structured response: {exc}"
+                    ) from exc
+
+            except Exception as exc:
+                last_error = exc
+                error_text = str(exc)
+
+                is_temporary = (
+                    "503" in error_text
+                    or "UNAVAILABLE" in error_text.upper()
+                    or "high demand" in error_text.lower()
+                    or "temporarily overloaded" in error_text.lower()
+                )
+
+                if not is_temporary:
+                    raise
+
+                if attempt < MAX_RETRIES_PER_MODEL - 1:
+                    time.sleep(2 ** attempt)
+
+    raise RuntimeError(
+        "Gemini is temporarily unavailable after retries. "
+        "Please wait a minute and try again. "
+        f"Last error: {last_error}"
     )
-
-    if not response.text:
-        raise RuntimeError("Gemini returned an empty response.")
-
-    try:
-        return ATSResult.model_validate_json(response.text)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not parse Gemini's structured response: {exc}"
-        ) from exc
 
 
 def get_api_key() -> str:
@@ -136,7 +169,7 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Settings")
-        st.markdown(f"**Model:** `{MODEL_NAME}`")
+        st.markdown(f"**Primary model:** `{PRIMARY_MODEL}` — fallbacks: Gemini 3.7 / 3.6 Flash")
         st.info(
             "For best results, add the target job description. The score is an AI-based estimate, "
             "not an official ATS score."
